@@ -1,4 +1,4 @@
-# Job/Internship Tracker
+# Job/Internship Tracker by Tai Rong
 
 A Chrome/Edge browser extension for tracking job and internship applications
 — straight into a Google Sheet you already own. No account to create, no
