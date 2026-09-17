@@ -1,28 +1,66 @@
 import { getAuthToken, AuthError } from '@/lib/auth';
-import { createTrackerSpreadsheet } from '@/lib/sheets';
-import { connectedSheetId, connectedSheetName, onboardingComplete } from '@/lib/storage';
-import { APPLICATION_COLUMNS } from '@/lib/schema';
+import { connectExistingSpreadsheet, createTrackerSpreadsheet, identityColumnMap, SheetsApiError } from '@/lib/sheets';
+import {
+  columnMapping,
+  connectedSheetId,
+  connectedSheetName,
+  connectedSheetTab,
+  onboardingComplete,
+} from '@/lib/storage';
+import { APPLICATION_COLUMNS, type ApplicationColumn } from '@/lib/schema';
 import { getCachedTheme, initTheme, toggleTheme } from '@/lib/theme';
 
 type Step = 'connect' | 'sheet-setup' | 'already-done';
 
 const app = document.getElementById('app')!;
 
+interface ConnectedExisting {
+  id: string;
+  name: string;
+  tab: string;
+  columns: Record<ApplicationColumn, number>;
+  addedColumns: ApplicationColumn[];
+}
+
 const state: {
   step: Step;
   token: string | null;
   connectError: string | null;
+
+  sheetName: string;
   creating: boolean;
   createError: string | null;
   createdSheet: { id: string; name: string; url: string } | null;
+
+  existingSheetInput: string;
+  connectingExisting: boolean;
+  connectExistingError: string | null;
+  connectedExisting: ConnectedExisting | null;
 } = {
   step: 'connect',
   token: null,
   connectError: null,
+
+  sheetName: `Internship Applications ${new Date().getFullYear()}`,
   creating: false,
   createError: null,
   createdSheet: null,
+
+  existingSheetInput: '',
+  connectingExisting: false,
+  connectExistingError: null,
+  connectedExisting: null,
 };
+
+// Accepts either a full Google Sheets URL or a bare spreadsheet ID.
+function extractSpreadsheetId(input: string): string | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  const urlMatch = trimmed.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (urlMatch?.[1]) return urlMatch[1];
+  if (/^[a-zA-Z0-9-_]{20,}$/.test(trimmed)) return trimmed;
+  return null;
+}
 
 const icons = {
   check: (color: string) =>
@@ -75,7 +113,7 @@ function renderConnect(): string {
           Job/Internship Tracker reads and writes only the one spreadsheet you choose on the next step &mdash; nothing else in your Drive, Gmail, or Google Account.
         </div>
         <button id="connect-btn" class="google-btn">${icons.google} Sign in with Google</button>
-        <div class="reassurance">${icons.lock}<span>We never see your password &middot; disconnect anytime in Settings</span></div>
+        <div class="reassurance">${icons.lock}<span>We never see your password &middot; disconnect anytime from the dashboard</span></div>
         ${state.connectError ? `<div class="error-banner">${escapeHtml(state.connectError)}</div>` : ''}
       </div>
     </div>
@@ -84,6 +122,8 @@ function renderConnect(): string {
 
 function renderSheetSetup(): string {
   const created = state.createdSheet;
+  const connectedExisting = state.connectedExisting;
+  const anyConnected = !!created || !!connectedExisting;
   return `
     ${topbar()}
     <div class="content">
@@ -108,7 +148,8 @@ function renderSheetSetup(): string {
             created
               ? `<div class="confirmed-sheet">${icons.check('#0A5F57')} Created &ldquo;${escapeHtml(created.name)}&rdquo; &mdash; <a href="${created.url}" target="_blank" rel="noopener">open in Sheets</a></div>
                  <button id="create-btn" class="secondary-btn" disabled>Sheet created</button>`
-              : `<button id="create-btn" class="primary-btn" ${state.creating ? 'disabled' : ''}>${state.creating ? 'Creating…' : 'Create Sheet'}</button>`
+              : `<input id="sheet-name-input" class="text-input" type="text" placeholder="Sheet name" value="${escapeHtml(state.sheetName)}" ${connectedExisting ? 'disabled' : ''} />
+                 <button id="create-btn" class="primary-btn" ${state.creating || connectedExisting ? 'disabled' : ''}>${state.creating ? 'Creating…' : 'Create Sheet'}</button>`
           }
           ${state.createError ? `<div class="error-banner">${escapeHtml(state.createError)}</div>` : ''}
         </div>
@@ -116,18 +157,21 @@ function renderSheetSetup(): string {
         <div class="choice-card">
           <div class="choice-icon neutral">${icons.search}</div>
           <div class="choice-title">Use an existing sheet</div>
-          <div class="choice-copy">Already tracking applications in a sheet? Connect it &mdash; we'll only add columns you're missing.</div>
-          <button class="secondary-btn" disabled>Browse Google Drive&hellip;</button>
-          <div class="coming-soon-note">Coming soon &mdash; connecting an existing sheet needs a small extra piece of setup for Google's file picker. Create a new sheet for now; you can still copy your old data in.</div>
+          <div class="choice-copy">Signed out and back in? Reconnect the sheet Job/Internship Tracker created for you last time &mdash; paste its link below and we'll pick up right where you left off.</div>
+          ${
+            connectedExisting
+              ? `<div class="confirmed-sheet">${icons.check('#0A5F57')} Connected &ldquo;${escapeHtml(connectedExisting.name)}&rdquo;${connectedExisting.addedColumns.length ? ` &mdash; added ${connectedExisting.addedColumns.length} missing column${connectedExisting.addedColumns.length > 1 ? 's' : ''}` : ''}</div>
+                 <button class="secondary-btn" disabled>Sheet connected</button>`
+              : `<input id="existing-sheet-input" class="text-input" type="text" placeholder="Paste sheet link or ID" value="${escapeHtml(state.existingSheetInput)}" ${created ? 'disabled' : ''} />
+                 <button id="connect-existing-btn" class="secondary-btn" ${state.connectingExisting || created ? 'disabled' : ''}>${state.connectingExisting ? 'Connecting…' : 'Connect Sheet'}</button>`
+          }
+          ${state.connectExistingError ? `<div class="error-banner">${escapeHtml(state.connectExistingError)}</div>` : ''}
         </div>
       </div>
 
       <div class="schema-card">
         <div class="schema-eyebrow">What we'll set up inside your sheet</div>
-        <div style="margin-bottom:14px;">
-          <span class="tab-chip active">Applications</span>
-          <span class="tab-chip">Status History</span>
-        </div>
+        <div class="schema-copy">An &ldquo;Applications&rdquo; tab with these columns, plus a &ldquo;Status History&rdquo; tab that logs every status change over time:</div>
         <div>
           ${APPLICATION_COLUMNS.map((c) => `<span class="col-chip">${c}</span>`).join('')}
         </div>
@@ -136,7 +180,7 @@ function renderSheetSetup(): string {
 
     <div class="footer">
       <button id="back-btn" class="footer-btn">Back</button>
-      <button id="continue-btn" class="footer-btn primary" ${created ? '' : 'disabled'}>Continue</button>
+      <button id="continue-btn" class="footer-btn primary" ${anyConnected ? '' : 'disabled'}>Continue</button>
     </div>
   `;
 }
@@ -174,7 +218,14 @@ function wire() {
     render();
   });
   document.getElementById('connect-btn')?.addEventListener('click', onConnectClick);
+  document.getElementById('sheet-name-input')?.addEventListener('input', (e) => {
+    state.sheetName = (e.target as HTMLInputElement).value;
+  });
   document.getElementById('create-btn')?.addEventListener('click', onCreateSheetClick);
+  document.getElementById('existing-sheet-input')?.addEventListener('input', (e) => {
+    state.existingSheetInput = (e.target as HTMLInputElement).value;
+  });
+  document.getElementById('connect-existing-btn')?.addEventListener('click', onConnectExistingClick);
   document.getElementById('back-btn')?.addEventListener('click', () => {
     state.step = 'connect';
     render();
@@ -211,11 +262,15 @@ async function onCreateSheetClick() {
 
   try {
     const year = new Date().getFullYear();
-    const title = `Internship Applications ${year}`;
+    const title = state.sheetName.trim() || `Internship Applications ${year}`;
     const sheet = await createTrackerSpreadsheet(state.token, title);
     state.createdSheet = { id: sheet.spreadsheetId, name: title, url: sheet.spreadsheetUrl };
-    await connectedSheetId.setValue(sheet.spreadsheetId);
-    await connectedSheetName.setValue(title);
+    await Promise.all([
+      connectedSheetId.setValue(sheet.spreadsheetId),
+      connectedSheetName.setValue(title),
+      connectedSheetTab.setValue('Applications'),
+      columnMapping.setValue(identityColumnMap()),
+    ]);
     state.creating = false;
     render();
     // Move on automatically instead of making the user click Continue —
@@ -225,6 +280,52 @@ async function onCreateSheetClick() {
   } catch (err) {
     state.creating = false;
     state.createError = 'Could not create the sheet. Please try again.';
+    render();
+  }
+}
+
+async function onConnectExistingClick() {
+  if (!state.token) {
+    state.step = 'connect';
+    render();
+    return;
+  }
+  const id = extractSpreadsheetId(state.existingSheetInput);
+  if (!id) {
+    state.connectExistingError = 'Paste the link to your Google Sheet, or its ID.';
+    render();
+    return;
+  }
+
+  state.connectingExisting = true;
+  state.connectExistingError = null;
+  render();
+
+  try {
+    const info = await connectExistingSpreadsheet(state.token, id);
+    state.connectedExisting = {
+      id: info.spreadsheetId,
+      name: info.title,
+      tab: info.tab,
+      columns: info.columns,
+      addedColumns: info.addedColumns,
+    };
+    await Promise.all([
+      connectedSheetId.setValue(info.spreadsheetId),
+      connectedSheetName.setValue(info.title),
+      connectedSheetTab.setValue(info.tab),
+      columnMapping.setValue(info.columns),
+    ]);
+    state.connectingExisting = false;
+    render();
+    await onboardingComplete.setValue(true);
+    setTimeout(goToDashboard, 900);
+  } catch (err) {
+    state.connectingExisting = false;
+    state.connectExistingError =
+      err instanceof SheetsApiError && err.status === 404
+        ? "Couldn't find that spreadsheet. Double-check the link and that it's shared with this Google Account."
+        : 'Could not connect that sheet. Please check the link and try again.';
     render();
   }
 }

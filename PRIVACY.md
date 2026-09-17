@@ -11,14 +11,13 @@ Job/Internship Tracker has no server of its own. Your application data lives ent
 ## What we access, and why
 
 ### Your Google Account
-Signing in requests two Google API permissions ("scopes"):
+Signing in requests one Google API permission ("scope"):
 
 - **Google Sheets** (`.../auth/spreadsheets`) — to create, read, and update the rows in your tracker spreadsheet (company, role, status, dates, notes, and similar fields).
-- **Google Drive, file-scoped** (`.../auth/drive.file`) — limited to spreadsheets the extension itself creates, or that you explicitly choose to connect. This does **not** grant access to your other Drive files, folders, photos, or documents. (In a future version, this same permission will let you connect an existing spreadsheet instead of only creating a new one.)
 
-*Note: the Sheets scope is technically broad enough to reach any spreadsheet in your Drive. In practice, Job/Internship Tracker only ever reads or writes the one spreadsheet you create or connect during setup — it never opens, lists, or modifies any other spreadsheet.*
+*Note: this scope is technically broad enough to reach any spreadsheet in your Drive. In practice, Job/Internship Tracker only ever reads or writes the one spreadsheet you create during setup — it never opens, lists, or modifies any other spreadsheet.*
 
-We do not request your email address, name, profile photo, contacts, calendar, or Gmail, and no other Google scope is requested.
+We do not request your email address, name, profile photo, contacts, calendar, Gmail, or general Drive access, and no other Google scope is requested.
 
 ### Application data you enter
 Company names, roles, statuses, dates, job posting URLs, recruiter/contact info, and notes you type are written directly to your own Google Sheet via Google's APIs. This data is never sent to, or stored on, any server operated by the developer.

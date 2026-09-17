@@ -1,6 +1,7 @@
 import { getAuthToken, AuthError } from '@/lib/auth';
 import {
   appendApplication,
+  connectExistingSpreadsheet,
   deleteApplicationRows,
   getApplications,
   updateApplicationFields,
@@ -8,12 +9,14 @@ import {
 } from '@/lib/sheets';
 import {
   cachedApplicationsSnapshot,
+  columnMapping,
   connectedSheetId,
+  connectedSheetTab,
   onboardingComplete,
   reconcileStatusOrder,
   statusFilterOrder,
 } from '@/lib/storage';
-import { DEFAULT_STATUS, STATUSES, type Application, type Status } from '@/lib/schema';
+import { DEFAULT_STATUS, STATUSES, type Application, type ApplicationColumn, type Status } from '@/lib/schema';
 import { STATUS_DOT, statusClass, statusLabel } from '@/lib/status';
 import { detectJobPosting, type DetectedJob } from '@/lib/job-detect';
 import { getCachedTheme, initTheme, toggleTheme } from '@/lib/theme';
@@ -35,6 +38,8 @@ type State =
       notes: string;
       token: string;
       sheetId: string;
+      tab: string;
+      columns: Record<ApplicationColumn, number>;
       saving: boolean;
       saved: boolean;
       error: string | null;
@@ -44,6 +49,8 @@ type State =
       applications: Application[];
       token: string;
       sheetId: string;
+      tab: string;
+      columns: Record<ApplicationColumn, number>;
       search: string;
       statusFilter: 'All' | Status;
       statusOrder: Status[];
@@ -63,6 +70,8 @@ type State =
       notes: string;
       token: string;
       sheetId: string;
+      tab: string;
+      columns: Record<ApplicationColumn, number>;
       saving: boolean;
       error: string | null;
       returnTo: Extract<State, { kind: 'update' }>;
@@ -667,7 +676,9 @@ async function onStatusChange(a: Application, newStatus: Status) {
   if (state.kind !== 'update') return;
   if (newStatus === a.status) return;
   try {
-    await updateApplicationFields(state.token, state.sheetId, a.rowIndex, { Status: newStatus });
+    await updateApplicationFields(state.token, state.sheetId, state.tab, state.columns, a.rowIndex, {
+      Status: newStatus,
+    });
     a.status = newStatus;
     state.openRowIndex = null;
     render();
@@ -684,8 +695,8 @@ async function onDeleteApplication(a: Application) {
   state.error = null;
   render();
   try {
-    await deleteApplicationRows(state.token, state.sheetId, [a.rowIndex]);
-    const applications = await getApplications(state.token, state.sheetId);
+    await deleteApplicationRows(state.token, state.sheetId, state.tab, [a.rowIndex]);
+    const applications = await getApplications(state.token, state.sheetId, state.tab, state.columns);
     cachedApplicationsSnapshot.setValue({ sheetId: state.sheetId, applications, cachedAt: Date.now() });
     state.applications = applications;
     state.openRowIndex = null;
@@ -708,14 +719,12 @@ function openDashboard() {
   window.close();
 }
 
-async function onReconnectClick() {
-  try {
-    await getAuthToken(true);
-    await init();
-  } catch {
-    state = { kind: 'auth-error' };
-    render();
-  }
+function onReconnectClick() {
+  // Interactive OAuth opens a separate Google window that steals focus, which
+  // auto-closes this action popup mid-flow before the token promise can
+  // resolve. Do the reconnect in the dashboard tab instead, where it already
+  // works (tabs don't close on blur).
+  openDashboard();
 }
 
 async function onSaveCapture() {
@@ -724,7 +733,7 @@ async function onSaveCapture() {
   state.error = null;
   render();
   try {
-    await appendApplication(state.token, state.sheetId, {
+    await appendApplication(state.token, state.sheetId, state.tab, state.columns, {
       company: state.company,
       role: state.role,
       status: state.status,
@@ -759,6 +768,8 @@ async function openQuickAdd() {
     notes: '',
     token: returnTo.token,
     sheetId: returnTo.sheetId,
+    tab: returnTo.tab,
+    columns: returnTo.columns,
     saving: false,
     error: null,
     returnTo,
@@ -783,7 +794,7 @@ async function onSaveQuickAdd() {
   state.error = null;
   render();
   try {
-    await appendApplication(state.token, state.sheetId, {
+    await appendApplication(state.token, state.sheetId, state.tab, state.columns, {
       company: state.company.trim(),
       role: state.role.trim(),
       status: state.status,
@@ -792,13 +803,15 @@ async function onSaveQuickAdd() {
       referral: state.referral,
       notes: state.notes.trim(),
     });
-    const applications = await getApplications(state.token, state.sheetId);
+    const applications = await getApplications(state.token, state.sheetId, state.tab, state.columns);
     cachedApplicationsSnapshot.setValue({ sheetId: state.sheetId, applications, cachedAt: Date.now() });
     state = {
       kind: 'update',
       applications,
       token: state.token,
       sheetId: state.sheetId,
+      tab: state.tab,
+      columns: state.columns,
       search: state.returnTo.search,
       statusFilter: state.returnTo.statusFilter,
       statusOrder: state.returnTo.statusOrder,
@@ -829,9 +842,11 @@ async function detectActiveTabJob(): Promise<DetectedJob | null> {
 }
 
 async function init() {
-  const [done, sheetId, storedOrder] = await Promise.all([
+  const [done, sheetId, tabStored, columnsStored, storedOrder] = await Promise.all([
     onboardingComplete.getValue(),
     connectedSheetId.getValue(),
+    connectedSheetTab.getValue(),
+    columnMapping.getValue(),
     statusFilterOrder.getValue(),
     initTheme(render),
   ]);
@@ -855,6 +870,22 @@ async function init() {
     return;
   }
 
+  let tab = tabStored;
+  let columns = columnsStored;
+  if (!columns) {
+    // A sheet connected before column positions were tracked (or one whose
+    // columns have drifted) has no usable mapping yet — resolve it here by
+    // re-matching the sheet's actual header row, then cache the result.
+    try {
+      const info = await connectExistingSpreadsheet(token, sheetId);
+      tab = info.tab;
+      columns = info.columns;
+      await Promise.all([connectedSheetTab.setValue(info.tab), columnMapping.setValue(info.columns)]);
+    } catch {
+      columns = {} as Record<ApplicationColumn, number>;
+    }
+  }
+
   const job = await jobPromise;
 
   if (job) {
@@ -869,6 +900,8 @@ async function init() {
       notes: '',
       token,
       sheetId,
+      tab,
+      columns,
       saving: false,
       saved: false,
       error: null,
@@ -886,6 +919,8 @@ async function init() {
       applications: snapshot.applications,
       token,
       sheetId,
+      tab,
+      columns,
       search: '',
       statusFilter: 'All',
       statusOrder,
@@ -898,12 +933,14 @@ async function init() {
   }
 
   try {
-    const applications = await getApplications(token, sheetId);
+    const applications = await getApplications(token, sheetId, tab, columns);
     state = {
       kind: 'update',
       applications,
       token,
       sheetId,
+      tab,
+      columns,
       search: '',
       statusFilter: 'All',
       statusOrder,
@@ -920,6 +957,8 @@ async function init() {
         applications: [],
         token,
         sheetId,
+        tab,
+        columns,
         search: '',
         statusFilter: 'All',
         statusOrder,

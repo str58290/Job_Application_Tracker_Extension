@@ -56,13 +56,3 @@ export interface Application {
   referral: boolean;
   notes: string;
 }
-
-// Fields a column can be mapped to when importing an existing sheet (MapColumns screen).
-export const IMPORT_TARGET_FIELDS = [
-  { value: 'company', label: 'Company', required: true },
-  { value: 'role', label: 'Role', required: true },
-  { value: 'status_reference', label: 'Status (reference)', required: false },
-  { value: 'dateApplied', label: 'Date Applied', required: false },
-  { value: 'notes', label: 'Notes', required: false },
-  { value: 'skip', label: "Don't import", required: false },
-] as const;

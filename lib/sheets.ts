@@ -9,7 +9,6 @@ import {
 } from './schema';
 
 const SHEETS_API = 'https://sheets.googleapis.com/v4/spreadsheets';
-const DRIVE_API = 'https://www.googleapis.com/drive/v3/files';
 
 export class SheetsApiError extends Error {
   constructor(message: string, public status: number) {
@@ -87,6 +86,28 @@ export async function createTrackerSpreadsheet(token: string, title: string): Pr
   return { spreadsheetId: data.spreadsheetId, spreadsheetUrl: data.spreadsheetUrl };
 }
 
+// The column map for a sheet we just created ourselves: header order is exactly
+// APPLICATION_COLUMNS, so positions are just its indices.
+export function identityColumnMap(): Record<ApplicationColumn, number> {
+  return Object.fromEntries(APPLICATION_COLUMNS.map((col, i) => [col, i])) as Record<
+    ApplicationColumn,
+    number
+  >;
+}
+
+// Matches a sheet's actual header row against our canonical columns by name
+// (case-insensitive, trimmed). Columns the sheet doesn't have are simply absent
+// from the result — callers append them rather than losing/reordering anything.
+export function matchColumns(headerRow: string[]): Partial<Record<ApplicationColumn, number>> {
+  const normalized = headerRow.map((h) => h.trim().toLowerCase());
+  const result: Partial<Record<ApplicationColumn, number>> = {};
+  for (const col of APPLICATION_COLUMNS) {
+    const index = normalized.indexOf(col.toLowerCase());
+    if (index !== -1) result[col] = index;
+  }
+  return result;
+}
+
 export interface SheetTab {
   title: string;
 }
@@ -129,8 +150,61 @@ export async function appendColumns(
   });
 }
 
-function rowToApplication(row: string[], rowIndex: number): Application {
-  const get = (col: ApplicationColumn) => row[APPLICATION_COLUMNS.indexOf(col)] ?? '';
+export interface ConnectedSheetInfo {
+  spreadsheetId: string;
+  title: string;
+  tab: string;
+  columns: Record<ApplicationColumn, number>;
+  addedColumns: ApplicationColumn[];
+}
+
+// Connects to an existing spreadsheet: picks its "Applications" tab (falling back
+// to the first tab), matches the tab's header row against our canonical columns by
+// name, and appends whichever canonical columns are missing. Never reorders,
+// renames, or overwrites anything already in the sheet — safe to run against a
+// sheet this extension created before, or a foreign one.
+export async function connectExistingSpreadsheet(
+  token: string,
+  spreadsheetId: string,
+): Promise<ConnectedSheetInfo> {
+  const res = await authedFetch(
+    token,
+    `${SHEETS_API}/${spreadsheetId}?fields=properties.title,sheets.properties.title`,
+  );
+  const data = (await res.json()) as {
+    properties: { title: string };
+    sheets: { properties: { title: string } }[];
+  };
+  const tabTitles = data.sheets.map((s) => s.properties.title);
+  const tab = tabTitles.includes(SHEET_TABS.applications) ? SHEET_TABS.applications : tabTitles[0];
+  if (!tab) throw new SheetsApiError('Spreadsheet has no sheets/tabs', 404);
+
+  const headerRow = await getHeaderRow(token, spreadsheetId, tab);
+  const matched = matchColumns(headerRow);
+  const addedColumns = APPLICATION_COLUMNS.filter((col) => matched[col] === undefined);
+
+  if (addedColumns.length > 0) {
+    await appendColumns(token, spreadsheetId, tab, headerRow.length, addedColumns);
+    addedColumns.forEach((col, i) => {
+      matched[col] = headerRow.length + i;
+    });
+  }
+
+  return {
+    spreadsheetId,
+    title: data.properties.title,
+    tab,
+    columns: matched as Record<ApplicationColumn, number>,
+    addedColumns,
+  };
+}
+
+function rowToApplication(
+  row: string[],
+  rowIndex: number,
+  columns: Record<ApplicationColumn, number>,
+): Application {
+  const get = (col: ApplicationColumn) => row[columns[col]] ?? '';
   const rawStatus = get('Status');
   const status = (STATUSES as readonly string[]).includes(rawStatus)
     ? (rawStatus as Status)
@@ -150,13 +224,18 @@ function rowToApplication(row: string[], rowIndex: number): Application {
   };
 }
 
-export async function getApplications(token: string, spreadsheetId: string): Promise<Application[]> {
+export async function getApplications(
+  token: string,
+  spreadsheetId: string,
+  tab: string,
+  columns: Record<ApplicationColumn, number>,
+): Promise<Application[]> {
   const res = await authedFetch(
     token,
-    `${SHEETS_API}/${spreadsheetId}/values/${encodeURIComponent(`${SHEET_TABS.applications}!A2:${LAST_COLUMN_LETTER}`)}`,
+    `${SHEETS_API}/${spreadsheetId}/values/${encodeURIComponent(`${tab}!A2:ZZ`)}`,
   );
   const data = (await res.json()) as { values?: string[][] };
-  return (data.values ?? []).map((row, i) => rowToApplication(row, i + 2));
+  return (data.values ?? []).map((row, i) => rowToApplication(row, i + 2, columns));
 }
 
 export interface NewApplication {
@@ -169,55 +248,61 @@ export interface NewApplication {
   notes?: string;
 }
 
-// Appends a new application row. Days in Status is left for the sheet or the
-// dashboard to fill in; Last Updated / Date Applied are stamped here.
-export async function appendApplication(token: string, spreadsheetId: string, app: NewApplication): Promise<void> {
+// Appends a new application row. Last Updated / Date Applied are stamped here;
+// Days in Status is written as a live formula that recomputes from Last Updated
+// on every open, so it never needs a separate update when status changes.
+export async function appendApplication(
+  token: string,
+  spreadsheetId: string,
+  tab: string,
+  columns: Record<ApplicationColumn, number>,
+  app: NewApplication,
+): Promise<void> {
   const today = new Date().toISOString().slice(0, 10);
-  const row = APPLICATION_COLUMNS.map((col) => {
-    switch (col) {
-      case 'Company':
-        return app.company;
-      case 'Role':
-        return app.role;
-      case 'Status':
-        return app.status ?? DEFAULT_STATUS;
-      case 'Date Applied':
-        return today;
-      case 'Last Updated':
-        return today;
-      case 'Job URL':
-        return app.jobUrl;
-      case 'Contact':
-        return app.contact ?? '';
-      case 'Referral?':
-        return app.referral ? 'Yes' : 'No';
-      case 'Notes':
-        return app.notes ?? '';
-      default:
-        return '';
-    }
-  });
+  const width = Math.max(...Object.values(columns)) + 1;
+  const row = new Array<string>(width).fill('');
+  const set = (col: ApplicationColumn, value: string) => {
+    row[columns[col]] = value;
+  };
+
+  set('Company', app.company);
+  set('Role', app.role);
+  set('Status', app.status ?? DEFAULT_STATUS);
+  set('Date Applied', today);
+  set('Last Updated', today);
+  const lastUpdatedLetter = columnLetter(columns['Last Updated']);
+  set(
+    'Days in Status',
+    `=IF(INDIRECT("${lastUpdatedLetter}"&ROW())="","",TODAY()-INDIRECT("${lastUpdatedLetter}"&ROW()))`,
+  );
+  set('Job URL', app.jobUrl);
+  set('Contact', app.contact ?? '');
+  set('Referral?', app.referral ? 'Yes' : 'No');
+  set('Notes', app.notes ?? '');
 
   await authedFetch(
     token,
-    `${SHEETS_API}/${spreadsheetId}/values/${encodeURIComponent(`${SHEET_TABS.applications}!A:${LAST_COLUMN_LETTER}`)}:append?valueInputOption=USER_ENTERED`,
+    `${SHEETS_API}/${spreadsheetId}/values/${encodeURIComponent(`${tab}!A:ZZ`)}:append?valueInputOption=USER_ENTERED`,
     { method: 'POST', body: JSON.stringify({ values: [row] }) },
   );
 }
 
 // Patches a subset of columns on an existing row (e.g. Status + Last Updated
 // from the dashboard's bulk-update action bar, or the popup's quick-update flow).
+// Updating Last Updated also refreshes Days in Status automatically, since that
+// column holds a formula referencing it rather than a stored value.
 export async function updateApplicationFields(
   token: string,
   spreadsheetId: string,
+  tab: string,
+  columns: Record<ApplicationColumn, number>,
   rowIndex: number,
   updates: Partial<Record<ApplicationColumn, string>>,
 ): Promise<void> {
   const withStamp = { ...updates, 'Last Updated': new Date().toISOString().slice(0, 10) };
   const data = Object.entries(withStamp).map(([col, value]) => {
-    const colIndex = APPLICATION_COLUMNS.indexOf(col as ApplicationColumn);
-    const letter = columnLetter(colIndex);
-    return { range: `${SHEET_TABS.applications}!${letter}${rowIndex}`, values: [[value]] };
+    const letter = columnLetter(columns[col as ApplicationColumn]);
+    return { range: `${tab}!${letter}${rowIndex}`, values: [[value]] };
   });
 
   await authedFetch(token, `${SHEETS_API}/${spreadsheetId}/values:batchUpdate`, {
@@ -226,14 +311,14 @@ export async function updateApplicationFields(
   });
 }
 
-async function getApplicationsSheetId(token: string, spreadsheetId: string): Promise<number> {
+async function getApplicationsSheetId(token: string, spreadsheetId: string, tab: string): Promise<number> {
   const res = await authedFetch(
     token,
     `${SHEETS_API}/${spreadsheetId}?fields=sheets.properties(sheetId,title)`,
   );
   const data = (await res.json()) as { sheets: { properties: { sheetId: number; title: string } }[] };
-  const sheet = data.sheets.find((s) => s.properties.title === SHEET_TABS.applications);
-  if (!sheet) throw new SheetsApiError(`Sheet tab "${SHEET_TABS.applications}" not found`, 404);
+  const sheet = data.sheets.find((s) => s.properties.title === tab);
+  if (!sheet) throw new SheetsApiError(`Sheet tab "${tab}" not found`, 404);
   return sheet.properties.sheetId;
 }
 
@@ -243,9 +328,10 @@ async function getApplicationsSheetId(token: string, spreadsheetId: string): Pro
 export async function deleteApplicationRows(
   token: string,
   spreadsheetId: string,
+  tab: string,
   rowIndexes: number[],
 ): Promise<void> {
-  const sheetId = await getApplicationsSheetId(token, spreadsheetId);
+  const sheetId = await getApplicationsSheetId(token, spreadsheetId, tab);
   const requests = [...rowIndexes]
     .sort((a, b) => b - a)
     .map((rowIndex) => ({
@@ -258,20 +344,4 @@ export async function deleteApplicationRows(
     method: 'POST',
     body: JSON.stringify({ requests }),
   });
-}
-
-export interface DriveFile {
-  id: string;
-  name: string;
-}
-
-// Only sees files the user has explicitly opened/created with this app, per the
-// drive.file scope — used to re-list a previously-picked sheet, not to browse Drive.
-export async function listAppVisibleSheets(token: string): Promise<DriveFile[]> {
-  const url = `${DRIVE_API}?q=${encodeURIComponent(
-    "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
-  )}&fields=files(id,name)`;
-  const res = await authedFetch(token, url);
-  const data = (await res.json()) as { files: DriveFile[] };
-  return data.files;
 }

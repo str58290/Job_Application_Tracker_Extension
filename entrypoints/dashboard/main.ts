@@ -1,12 +1,20 @@
-import { getAuthToken } from '@/lib/auth';
+import { getAuthToken, signOut } from '@/lib/auth';
 import {
   appendApplication,
+  connectExistingSpreadsheet,
   deleteApplicationRows,
   getApplications,
   updateApplicationFields,
   SheetsApiError,
 } from '@/lib/sheets';
-import { connectedSheetId, connectedSheetName, onboardingComplete } from '@/lib/storage';
+import {
+  columnMapping,
+  connectedSheetId,
+  connectedSheetName,
+  connectedSheetTab,
+  onboardingComplete,
+  resetOnboarding,
+} from '@/lib/storage';
 import { STATUSES, DEFAULT_STATUS, type Application, type ApplicationColumn, type Status } from '@/lib/schema';
 import { STATUS_DOT, statusClass, statusLabel } from '@/lib/status';
 import { getCachedTheme, initTheme, toggleTheme } from '@/lib/theme';
@@ -35,6 +43,8 @@ type AppState =
       token: string;
       sheetId: string;
       sheetName: string;
+      tab: string;
+      columns: Record<ApplicationColumn, number>;
       applications: Application[];
       view: View;
       search: string;
@@ -73,6 +83,8 @@ const icons = {
   moon: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6B6A64" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>',
   clock:
     '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#767469" stroke-width="2"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 3"></path></svg>',
+  logout:
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6B6A64" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><path d="M16 17l5-5-5-5"></path><path d="M21 12H9"></path></svg>',
 };
 
 function escapeHtml(s: string): string {
@@ -183,6 +195,7 @@ function renderTopbar(s: ReadyState): string {
         <button id="open-sheet-btn" class="icon-btn" title="Open in Google Sheets">${icons.external}</button>
         <button id="refresh-btn" class="icon-btn" title="Refresh">${icons.refresh}</button>
         <button id="theme-toggle-btn" class="icon-btn" title="Toggle theme">${isDark ? icons.sun : icons.moon}</button>
+        <button id="disconnect-btn" class="icon-btn" title="Disconnect Google Account">${icons.logout}</button>
       </div>
     </div>
   `;
@@ -471,7 +484,7 @@ async function onEditorSave() {
 
   try {
     if (d.mode === 'create') {
-      await appendApplication(state.token, state.sheetId, {
+      await appendApplication(state.token, state.sheetId, state.tab, state.columns, {
         company: d.company.trim(),
         role: d.role.trim(),
         status: d.status,
@@ -481,7 +494,7 @@ async function onEditorSave() {
         notes: d.notes.trim(),
       });
     } else if (d.rowIndex !== null) {
-      await updateApplicationFields(state.token, state.sheetId, d.rowIndex, {
+      await updateApplicationFields(state.token, state.sheetId, state.tab, state.columns, d.rowIndex, {
         Company: d.company.trim(),
         Role: d.role.trim(),
         Status: d.status,
@@ -491,7 +504,7 @@ async function onEditorSave() {
         Notes: d.notes.trim(),
       });
     }
-    state.applications = await getApplications(state.token, state.sheetId);
+    state.applications = await getApplications(state.token, state.sheetId, state.tab, state.columns);
     state.editor = null;
     state.editorSaving = false;
     render();
@@ -514,8 +527,8 @@ async function onEditorDelete() {
   render();
 
   try {
-    await deleteApplicationRows(state.token, state.sheetId, [d.rowIndex]);
-    state.applications = await getApplications(state.token, state.sheetId);
+    await deleteApplicationRows(state.token, state.sheetId, state.tab, [d.rowIndex]);
+    state.applications = await getApplications(state.token, state.sheetId, state.tab, state.columns);
     state.editor = null;
     state.editorDeleting = false;
     render();
@@ -552,6 +565,7 @@ function wire() {
     await toggleTheme();
     render();
   });
+  document.getElementById('disconnect-btn')?.addEventListener('click', onDisconnectClick);
 
   document.getElementById('view-kanban-btn')?.addEventListener('click', () => {
     s.view = 'kanban';
@@ -615,7 +629,7 @@ function wire() {
 async function onRefresh() {
   if (state.kind !== 'ready') return;
   try {
-    state.applications = await getApplications(state.token, state.sheetId);
+    state.applications = await getApplications(state.token, state.sheetId, state.tab, state.columns);
     state.error = null;
   } catch {
     state.error = 'Could not refresh. Please try again.';
@@ -637,9 +651,9 @@ async function onBulkApply() {
 
   try {
     for (const rowIndex of rows) {
-      await updateApplicationFields(state.token, state.sheetId, rowIndex, updates);
+      await updateApplicationFields(state.token, state.sheetId, state.tab, state.columns, rowIndex, updates);
     }
-    state.applications = await getApplications(state.token, state.sheetId);
+    state.applications = await getApplications(state.token, state.sheetId, state.tab, state.columns);
     state.selected.clear();
     render();
   } catch {
@@ -658,14 +672,21 @@ async function onBulkDelete() {
   render();
 
   try {
-    await deleteApplicationRows(state.token, state.sheetId, rows);
-    state.applications = await getApplications(state.token, state.sheetId);
+    await deleteApplicationRows(state.token, state.sheetId, state.tab, rows);
+    state.applications = await getApplications(state.token, state.sheetId, state.tab, state.columns);
     state.selected.clear();
     render();
   } catch {
     state.error = 'Could not delete those applications. Please try again.';
     render();
   }
+}
+
+async function onDisconnectClick() {
+  if (!window.confirm('Disconnect your Google Account? Your data stays safe in your Google Sheet — you can reconnect anytime.')) return;
+  await signOut();
+  await resetOnboarding();
+  window.location.href = '/onboarding.html';
 }
 
 async function onReconnectClick() {
@@ -682,10 +703,12 @@ async function init(existingToken?: string) {
   state = { kind: 'loading' };
   render();
 
-  const [done, sheetId, sheetName] = await Promise.all([
+  const [done, sheetId, sheetName, tab, columns] = await Promise.all([
     onboardingComplete.getValue(),
     connectedSheetId.getValue(),
     connectedSheetName.getValue(),
+    connectedSheetTab.getValue(),
+    columnMapping.getValue(),
   ]);
 
   if (!done || !sheetId) {
@@ -712,6 +735,8 @@ async function init(existingToken?: string) {
     token,
     sheetId,
     sheetName: sheetName ?? 'Untitled sheet',
+    tab,
+    columns: columns ?? ({} as Record<ApplicationColumn, number>),
     applications: [],
     view: 'kanban',
     search: '',
@@ -726,7 +751,16 @@ async function init(existingToken?: string) {
   };
 
   try {
-    ready.applications = await getApplications(token, sheetId);
+    // A sheet connected before column positions were tracked (or one whose
+    // columns have drifted) has no usable mapping yet — resolve it here by
+    // re-matching the sheet's actual header row, then cache the result.
+    if (!columns) {
+      const info = await connectExistingSpreadsheet(token, sheetId);
+      ready.tab = info.tab;
+      ready.columns = info.columns;
+      await Promise.all([connectedSheetTab.setValue(info.tab), columnMapping.setValue(info.columns)]);
+    }
+    ready.applications = await getApplications(token, sheetId, ready.tab, ready.columns);
   } catch (err) {
     ready.error =
       err instanceof SheetsApiError ? 'Could not load your applications. Please refresh.' : 'Something went wrong loading your applications.';

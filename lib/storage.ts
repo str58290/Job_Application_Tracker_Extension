@@ -1,10 +1,5 @@
 import { storage } from 'wxt/utils/storage';
-import { STATUSES, type Application, type Status } from './schema';
-
-export interface ColumnMapping {
-  sourceHeader: string;
-  targetField: string;
-}
+import { SHEET_TABS, STATUSES, type Application, type ApplicationColumn, type Status } from './schema';
 
 export const connectedSheetId = storage.defineItem<string | null>('local:sheetId', {
   fallback: null,
@@ -14,11 +9,33 @@ export const connectedSheetName = storage.defineItem<string | null>('local:sheet
   fallback: null,
 });
 
+// Which tab in the connected spreadsheet holds application rows. Defaults to the
+// canonical tab name for sheets connected before this was tracked separately.
+export const connectedSheetTab = storage.defineItem<string>('local:connectedSheetTab', {
+  fallback: SHEET_TABS.applications,
+});
+
 export const onboardingComplete = storage.defineItem<boolean>('local:onboardingComplete', {
   fallback: false,
 });
 
-export const columnMapping = storage.defineItem<ColumnMapping[] | null>('local:columnMapping', {
+// Maps each canonical column to its actual position (0-based) in the connected
+// sheet's header row. Resolved once on connect/create and re-resolved whenever
+// it's missing, so sheets with a drifted or foreign column order still work.
+export const columnMapping = storage.defineItem<Record<ApplicationColumn, number> | null>(
+  'local:columnMapping',
+  { fallback: null },
+);
+
+// Cached OAuth access token from chrome.identity.launchWebAuthFlow — replaces
+// chrome.identity.getAuthToken's built-in token cache, which we no longer use
+// since launchWebAuthFlow doesn't cache tokens itself.
+export interface CachedAuthToken {
+  token: string;
+  expiresAt: number;
+}
+
+export const cachedAuthToken = storage.defineItem<CachedAuthToken | null>('local:cachedAuthToken', {
   fallback: null,
 });
 
@@ -60,6 +77,7 @@ export async function resetOnboarding(): Promise<void> {
   await Promise.all([
     connectedSheetId.setValue(null),
     connectedSheetName.setValue(null),
+    connectedSheetTab.setValue(SHEET_TABS.applications),
     onboardingComplete.setValue(false),
     columnMapping.setValue(null),
   ]);
